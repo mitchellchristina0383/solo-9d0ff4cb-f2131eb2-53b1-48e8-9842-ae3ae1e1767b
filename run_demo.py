@@ -19,7 +19,7 @@ import time
 import httpx
 import uvicorn
 
-from common.deterministic import expected_token_ids
+from common.deterministic import expected_token_ids, token_text
 from gateway.app import GatewayConfig, create_app as create_gateway
 from node.app import NodeConfig, create_app as create_node
 
@@ -38,11 +38,12 @@ def serve(app, port):
     return server
 
 
-async def consume(client: httpx.AsyncClient, scenario: str):
+async def consume(client: httpx.AsyncClient, scenario: str, stop_marker: str = ""):
     events: list[tuple[str, dict]] = []
     async with client.stream(
         "POST", "http://127.0.0.1:8908/api/chat",
-        json={"prompt": PROMPT, "max_tokens": MAX_TOKENS, "scenario": scenario},
+        json={"prompt": PROMPT, "max_tokens": MAX_TOKENS, "scenario": scenario,
+              "stop_marker": stop_marker},
     ) as resp:
         event = None
         data: list[str] = []
@@ -59,36 +60,48 @@ async def consume(client: httpx.AsyncClient, scenario: str):
     return events
 
 
-def report(scenario: str, events, healthy_ids):
-    print(f"\n{'=' * 78}\n场景: {scenario}\n{'=' * 78}")
+def report(scenario: str, events, healthy_ids, stop_marker: str = ""):
+    print(f"\n{'=' * 78}\n场景: {scenario}"
+          f"{f'（结束标记 = {stop_marker!r}）' if stop_marker else ''}\n{'=' * 78}")
     tokens = [e for n, e in events if n == "token"]
     for name, e in events:
         if name == "meta":
             print(f"[meta] request={e['request_id'][:8]}… 上限={e['max_tokens']}")
         elif name == "fallback":
             print(f"[fallback] {e['reason']}：{e['from_node']} 已采纳 {e['accepted_count']} "
-                  f"个词元后切换到 {e['to_node']}")
+                  f"个词元后切换到 {e['to_node']}"
+                  + (f"（其中 {e.get('marker_pending_count')} 个因可能是标记而暂存）"
+                     if e.get("marker_pending_count") else ""))
         elif name == "incomplete":
             print(f"[incomplete] reason={e['reason']} 保留 {e['accepted_count']} 个词元")
             if "primary_identity" in e:
                 print(f"             primary={e['primary_identity']}")
                 print(f"             backup ={e['backup_identity']}")
+    end = next((e for n, e in events if n in ("done", "incomplete")), {})
     by_node: dict[str, list[str]] = {}
     for t in tokens:
         by_node.setdefault(t["node"], []).append(t["text"])
     for node, texts in by_node.items():
         print(f"[tokens:{node}] ({len(texts)}) {' '.join(texts)}")
     ids = [t["id"] for t in tokens]
-    final = "done" in {n for n, _ in events}
-    if final:
-        ok = ids == healthy_ids
-        print(f"[核对] 完整回复词元数={len(ids)}/{MAX_TOKENS}，与 healthy 一致: {ok}")
-        assert ok, "failover result diverged from healthy baseline"
-    else:
-        n = len(ids)
-        ok = ids == healthy_ids[:n]
-        print(f"[核对] 未完成，保留前缀 {n}/{MAX_TOKENS} 个词元，与 healthy 同位置前缀一致: {ok}")
+    n = len(ids)
+    prefix_ok = ids == healthy_ids[:n]
+    if end.get("reason") == "stop_marker":
+        print(f"[marker] 命中结束标记 {end['stop_marker']}，下标 {end['marker_index']}–"
+              f"{end['marker_end_index'] - 1} 计入上限但未下发；"
+              f"共接受 {end['token_count']} 个，下发 {end['emitted_count']} 个")
+        ok = prefix_ok and n == end["marker_index"] and end["emitted_count"] == n
+        print(f"[核对] 下发内容是否为基准在标记之前的前缀: {ok}")
         assert ok
+    elif "done" not in {nm for nm, _ in events}:
+        print(f"[incomplete] 保留 {n}/{MAX_TOKENS} 个已下发词元，与 healthy 同位置前缀一致: {prefix_ok}")
+        assert prefix_ok
+    else:
+        ok = prefix_ok and n == MAX_TOKENS
+        print(f"[核对] 完整回复词元数={n}/{MAX_TOKENS}，与 healthy 一致: {ok}")
+        assert ok, "failover result diverged from healthy baseline"
+    if end.get("partial_marker"):
+        print(f"[marker] 末尾只有半截标记 {end['partial_marker']}，已照常作为正文发出")
     return tokens
 
 
@@ -122,6 +135,26 @@ async def main():
             report("failover_success", await consume(client, "failover_success"), healthy_ids)
             report("failover_backup_error", await consume(client, "failover_backup_error"), healthy_ids)
             report("version_mismatch", await consume(client, "version_mismatch"), healthy_ids)
+
+            # --- stop marker demos ------------------------------------------
+            texts = [token_text(PROMPT, i) for i in range(MAX_TOKENS)]
+            print(f"\n确定性词元文本: {texts}")
+
+            # Marker on the primary node ("forest bridge" at 2–3).
+            report("healthy", await consume(client, "healthy", "forest bridge"),
+                   healthy_ids, "forest bridge")
+            # Marker spanning the failover boundary ("bridge jasmine": index 3
+            # from node-a, index 4 from node-b).
+            report("failover_success", await consume(client, "failover_success", "bridge jasmine"),
+                   healthy_ids, "bridge jasmine")
+            # Budget runs out on a partial marker: index 10 ("over") is the
+            # only token of "over zzz" that arrives, so it is emitted.
+            report("healthy", await consume(client, "healthy", f"{texts[10]} zzz"),
+                   healthy_ids, f"{texts[10]} zzz")
+            # Fault termination right after a partial marker ("anchor" at 6).
+            report("failover_backup_error",
+                   await consume(client, "failover_backup_error", f"{texts[6]} zzz"),
+                   healthy_ids, f"{texts[6]} zzz")
 
             # Prove the abandoned primary really sent late packets afterwards.
             await asyncio.sleep(2.2)

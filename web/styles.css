@@ -59,6 +59,7 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .status.running { background: #233550; color: var(--accent); }
 .status.done { background: #1d3b2c; color: var(--node-a); }
 .status.incomplete { background: #4a2326; color: var(--warn); }
+.status.marker { background: #3a2a12; color: var(--node-b); }
 .output {
   min-height: 96px;
   border: 1px dashed var(--border);
@@ -78,6 +79,8 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 }
 .token.node-a { border-color: rgba(126, 224, 168, .55); color: var(--node-a); }
 .token.node-b { border-color: rgba(255, 184, 107, .55); color: var(--node-b); }
+.token.swallowed { border-style: dashed; opacity: .8; }
+.token.swallowed::after { content: " ⃠"; color: var(--warn); }
 @keyframes pop { from { transform: translateY(4px); opacity: 0; } to { transform: none; opacity: 1; } }
 .events { margin-top: 10px; font-size: 13px; }
 .event-line { padding: 4px 8px; border-left: 3px solid var(--accent); margin-bottom: 6px; background: #101725; border-radius: 0 6px 6px 0; }
@@ -87,6 +90,12 @@ button:disabled { opacity: .5; cursor: not-allowed; }
 .chip { font-weight: 700; padding: 2px 8px; border-radius: 6px; margin: 0 4px; }
 .chip.node-a { color: var(--node-a); border: 1px solid rgba(126,224,168,.5); }
 .chip.node-b { color: var(--node-b); border: 1px solid rgba(255,184,107,.5); }
+.chip.swallowed { color: var(--warn); border: 1px dashed rgba(255,122,122,.6); }
+.marker-info { margin-top: 10px; font-size: 13px; color: var(--muted); }
+.marker-info .swallow { color: var(--warn); border: 1px dashed rgba(255,122,122,.6); border-radius: 6px; padding: 1px 6px; }
+.presets { display: flex; flex-wrap: wrap; gap: 8px; }
+.presets button { font-weight: 500; background: #243047; color: var(--text); border: 1px solid var(--border); }
+.presets button:hover:not(:disabled) { border-color: var(--accent); }
 .verification { margin-top: 12px; padding: 12px; border-radius: 8px; font-size: 14px; }
 .verification.pass { background: #1d3b2c; border: 1px solid rgba(126,224,168,.4); }
 .verification.fail { background: #4a2326; border: 1px solid rgba(255,122,122,.4); }

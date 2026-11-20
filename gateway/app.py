@@ -13,6 +13,13 @@ Responsibilities:
   ``max_tokens - accepted_count``.
 * Refuse failover (keep displayed text, mark incomplete) when the two nodes
   report different model/tokenizer identities, or when the backup fails.
+* Optional answer stop marker: a sequence of space-separated whole tokens.
+  Tokens that cannot be part of the marker stream out normally; a suffix that
+  might still become the marker is held back.  On the first complete match the
+  matched span counts toward the token budget but is *not* forwarded to the
+  caller, and generation ends.  Hold-back state survives failover, and if
+  generation ends before the marker completes (budget or fault) the held tail
+  is flushed as ordinary token events.
 """
 from __future__ import annotations
 
@@ -101,6 +108,9 @@ class ChatRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=1000)
     max_tokens: int = Field(ge=1, le=128)
     scenario: str = "healthy"
+    # Optional stop marker: one or more space-separated whole tokens.  Empty
+    # (the default) keeps the original behavior of streaming all tokens.
+    stop_marker: str = Field(default="", max_length=200)
 
 
 def sse(event: str, data: dict) -> bytes:
@@ -177,6 +187,84 @@ def create_app(
 
 
 # ---------------------------------------------------------------------------
+# Stop marker
+# ---------------------------------------------------------------------------
+
+class MarkerGate:
+    """Holds back only tokens that could still complete the stop marker.
+
+    The marker is matched as a contiguous run of whole token texts; token
+    boundaries and indices are never split.  Each pushed token either makes a
+    complete match (the whole matched run is swallowed, generation stops), or
+    can still become the start of a match (held back), or cannot (released).
+    Holding back only a suffix keeps ordinary tokens flowing immediately.
+    """
+
+    def __init__(self, marker: list[str]):
+        self.marker = marker
+        self.pending: list[dict] = []
+        self.hit: dict | None = None
+
+    def push(self, token: dict) -> None:
+        self.pending.append(token)
+
+    def _scan(self) -> tuple[int | None, int | None]:
+        """Return (match_start, hold_from) as offsets into ``pending``.
+
+        Candidates may overlap and their partial suffix can be as long as
+        ``len(marker) - 1``: released tokens can never be needed again for a
+        later match, because every pending token is scanned on each call.
+        """
+        marker = self.marker
+        n = len(marker)
+        texts = [tok["text"] for tok in self.pending]
+        for start in range(len(texts)):
+            if texts[start] != marker[0]:
+                continue
+            length = 1
+            while length < n and start + length < len(texts) \
+                    and texts[start + length] == marker[length]:
+                length += 1
+            if length == n:
+                return start, start
+        hold_from: int | None = None
+        for start in range(max(0, len(texts) - n + 1), len(texts)):
+            if texts[start] != marker[0]:
+                continue
+            if texts[start:] == marker[:len(texts) - start]:
+                hold_from = start
+                break
+        return None, hold_from
+
+    def release(self, force: bool = False) -> list[dict]:
+        """Tokens that are safe to send now, in order.
+
+        With ``force`` (stream over: budget reached or failure) everything is
+        released, including a trailing partial marker.  After a hit only the
+        tokens preceding the matched run are released -- once, because the
+        pending list is cleared.
+        """
+        if not self.marker:
+            out, self.pending = self.pending, []
+            return out
+        if self.hit is not None:
+            return []
+        match_start, hold_from = self._scan()
+        if match_start is not None:
+            head = int(self.pending[match_start]["index"])
+            self.hit = {"start": head, "end": head + len(self.marker)}
+            out = self.pending[:match_start]
+            self.pending = []
+            return out
+        if force or hold_from is None:
+            out, self.pending = self.pending, []
+            return out
+        out = self.pending[:hold_from]
+        del self.pending[:hold_from]
+        return out
+
+
+# ---------------------------------------------------------------------------
 # Orchestration state machine
 # ---------------------------------------------------------------------------
 
@@ -194,12 +282,17 @@ async def _orchestrate(
     primary_identity: tuple[str, str] | None = None
     next_index = 0
 
+    marker_tokens = body.stop_marker.split()
+    gate = MarkerGate(marker_tokens)
+
     yield sse("meta", {
         "request_id": request_id,
         "scenario": body.scenario,
         "max_tokens": max_tokens,
         "primary": cfg.primary_name,
         "backup": cfg.backup_name,
+        "stop_marker": body.stop_marker,
+        "marker_tokens": marker_tokens,
     })
 
     def accept_token(obj: dict, node: str) -> bool:
@@ -216,7 +309,56 @@ async def _orchestrate(
         accepted_texts.append(str(obj["text"]))
         provenance.append(node)
         next_index += 1
+        gate.push({**obj, "node": node})
         return True
+
+    async def flush(force: bool) -> AsyncIterator[bytes]:
+        """Send whatever the marker gate releases as token events."""
+        for tok in gate.release(force=force):
+            yield sse("token", tok)
+
+    def done_event(reason: str, extra: dict | None = None) -> bytes:
+        # ``token_count`` counts every accepted token (including the matched
+        # marker span, which is part of the budget); ``emitted_count`` counts
+        # what actually went out on the stream.
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "token_count": next_index,
+            "emitted_count": next_index - (len(marker_tokens) if gate.hit else 0),
+            "nodes": _node_shares(provenance),
+            "marker_tokens": marker_tokens,
+            "partial_marker": trailing_partial_marker(),
+        }
+        if gate.hit:
+            payload["stop_marker"] = marker_tokens
+            payload["marker_index"] = gate.hit["start"]
+            payload["marker_end_index"] = gate.hit["end"]
+        payload.update(extra or {})
+        return sse("done", payload)
+
+    def trailing_partial_marker() -> list[str] | None:
+        """Proper prefix of the marker at the very end of the accepted text.
+
+        Reported when generation stops before the marker completed: that tail
+        was flushed as ordinary tokens, as required.
+        """
+        if not marker_tokens or gate.hit:
+            return None
+        for j in range(len(marker_tokens) - 1, 0, -1):
+            if j <= len(accepted_texts) and accepted_texts[-j:] == marker_tokens[:j]:
+                return marker_tokens[:j]
+        return None
+
+    def incomplete_event(reason: str, extra: dict | None = None) -> bytes:
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "accepted_count": next_index,
+            "prefix_text": " ".join(accepted_texts),
+            "marker_tokens": marker_tokens,
+            "partial_marker": trailing_partial_marker(),
+        }
+        payload.update(extra or {})
+        return sse("incomplete", payload)
 
     # ---- primary node ------------------------------------------------------
     primary_fault = faults["primary"]
@@ -261,8 +403,9 @@ async def _orchestrate(
                         elif event == "token":
                             obj = json.loads(data)
                             if accept_token(obj, cfg.primary_name):
-                                yield sse("token", {**obj, "node": cfg.primary_name})
-                                if next_index >= max_tokens:
+                                async for chunk in flush(force=False):
+                                    yield chunk
+                                if gate.hit or next_index >= max_tokens:
                                     break
                         elif event == "error":
                             primary_error = data
@@ -273,12 +416,19 @@ async def _orchestrate(
     except httpx.HTTPError as exc:
         primary_error = f"{type(exc).__name__}: {exc}"
 
-    # Healthy completion on the primary: nothing else to do.
+    # Marker matched on the primary: the matched span was withheld, stop.
+    if gate.hit:
+        logger.info("stop marker matched on %s for %s at index %d",
+                    cfg.primary_name, request_id, gate.hit["start"])
+        yield done_event("stop_marker")
+        return
+
+    # Healthy completion on the primary: nothing else to do.  A trailing
+    # partial marker is ordinary text when the budget runs out.
     if not timed_out and primary_error is None and next_index >= max_tokens:
-        yield sse("done", {
-            "reason": "max_tokens", "token_count": next_index,
-            "nodes": _node_shares(provenance),
-        })
+        async for chunk in flush(force=True):
+            yield chunk
+        yield done_event("max_tokens")
         return
 
     # Primary finished without error but short of the budget: treat as failure.
@@ -286,10 +436,9 @@ async def _orchestrate(
         primary_error = "primary_ended_early"
 
     if next_index >= max_tokens:
-        yield sse("done", {
-            "reason": "max_tokens", "token_count": next_index,
-            "nodes": _node_shares(provenance),
-        })
+        async for chunk in flush(force=True):
+            yield chunk
+        yield done_event("max_tokens")
         return
 
     yield sse("fallback", {
@@ -297,6 +446,7 @@ async def _orchestrate(
         "from_node": cfg.primary_name,
         "to_node": cfg.backup_name,
         "accepted_count": next_index,
+        "marker_pending_count": len(gate.pending),
         "detail": primary_error,
     })
 
@@ -308,12 +458,9 @@ async def _orchestrate(
             info_resp.raise_for_status()
             backup_info = info_resp.json()
         except (httpx.HTTPError, ValueError) as exc:
-            yield sse("incomplete", {
-                "reason": "backup_unreachable",
-                "detail": str(exc),
-                "accepted_count": next_index,
-                "prefix_text": " ".join(accepted_texts),
-            })
+            async for chunk in flush(force=True):
+                yield chunk
+            yield incomplete_event("backup_unreachable", {"detail": str(exc)})
             return
         backup_identity = (backup_info["model_id"], backup_info["tokenizer_version"])
 
@@ -322,18 +469,19 @@ async def _orchestrate(
                 "refusing failover for %s: identity mismatch primary=%s backup=%s",
                 request_id, primary_identity, backup_identity,
             )
-            yield sse("incomplete", {
-                "reason": "version_mismatch",
+            async for chunk in flush(force=True):
+                yield chunk
+            yield incomplete_event("version_mismatch", {
                 "primary_identity": {"model_id": primary_identity[0],
                                      "tokenizer_version": primary_identity[1]},
                 "backup_identity": {"model_id": backup_identity[0],
                                     "tokenizer_version": backup_identity[1]},
-                "accepted_count": next_index,
-                "prefix_text": " ".join(accepted_texts),
             })
             return
 
         # ---- backup continuation with the shared token budget -------------
+        # accepted_ids includes tokens still held back by the marker gate:
+        # the backup continues from everything the gateway has accepted.
         remaining = max_tokens - next_index
         backup_payload = {
             "request_id": request_id,
@@ -356,8 +504,9 @@ async def _orchestrate(
                         if event == "token":
                             obj = json.loads(data)
                             if accept_token(obj, cfg.backup_name):
-                                yield sse("token", {**obj, "node": cfg.backup_name})
-                                if next_index >= max_tokens:
+                                async for chunk in flush(force=False):
+                                    yield chunk
+                                if gate.hit or next_index >= max_tokens:
                                     break
                         elif event == "error":
                             backup_failed = data
@@ -367,22 +516,24 @@ async def _orchestrate(
         except httpx.HTTPError as exc:
             backup_failed = f"{type(exc).__name__}: {exc}"
 
-    if backup_failed is not None or next_index < max_tokens:
-        logger.warning("backup continuation failed for %s: %s", request_id, backup_failed)
-        yield sse("incomplete", {
-            "reason": "backup_failed",
-            "detail": backup_failed,
-            "accepted_count": next_index,
-            "prefix_text": " ".join(accepted_texts),
-        })
+    # A marker can complete across the failover boundary: tokens held back
+    # before the switch plus the backup's first token(s).
+    if gate.hit:
+        logger.info("stop marker matched across failover for %s at index %d",
+                    request_id, gate.hit["start"])
+        yield done_event("stop_marker", {"identical_to_healthy": True})
         return
 
-    yield sse("done", {
-        "reason": "max_tokens",
-        "token_count": next_index,
-        "nodes": _node_shares(provenance),
-        "identical_to_healthy": True,
-    })
+    if backup_failed is None and next_index >= max_tokens:
+        async for chunk in flush(force=True):
+            yield chunk
+        yield done_event("max_tokens", {"identical_to_healthy": True})
+        return
+
+    logger.warning("backup continuation failed for %s: %s", request_id, backup_failed)
+    async for chunk in flush(force=True):
+        yield chunk
+    yield incomplete_event("backup_failed", {"detail": backup_failed})
 
 
 def _node_shares(provenance: list[str]) -> dict[str, int]:

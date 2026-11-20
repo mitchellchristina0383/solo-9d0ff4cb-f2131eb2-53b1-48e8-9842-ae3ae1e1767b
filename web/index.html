@@ -30,6 +30,11 @@
             <select id="scenario"></select>
           </label>
         </div>
+        <label>
+          回答结束标记（可选，空格分隔的完整词元；留空则输出全部词元）
+          <input id="stop-marker" type="text" value="" maxlength="200"
+                 placeholder="例如：bridge jasmine" />
+        </label>
         <div class="row">
           <button type="submit" id="run-btn">生成回复</button>
           <span id="status" class="status idle">空闲</span>
@@ -42,12 +47,22 @@
       <div id="output" class="output" aria-live="polite">
         <span class="placeholder">（回复将在这里逐词元出现）</span>
       </div>
+      <div id="marker-info" class="marker-info hidden"></div>
       <div id="events" class="events" aria-live="polite"></div>
       <div class="meta-row">
         <span id="counter">已采纳词元：0</span>
         <span id="shares"></span>
       </div>
       <div id="verification" class="verification hidden"></div>
+    </section>
+
+    <section class="panel">
+      <h2>结束标记快速填充</h2>
+      <p class="legend" style="padding-left:0">
+        下面的按钮会按当前提示词，从确定性词元流中选出演示用的标记：
+        无故障命中、跨主备切换的命中、以及会触发上限/故障截断的「尾部半截标记」。
+      </p>
+      <div id="marker-presets" class="presets"></div>
     </section>
 
     <section class="panel">
@@ -61,6 +76,12 @@
       <p class="legend">
         词元颜色：<span class="chip node-a">node-a（首节点）</span>
         <span class="chip node-b">node-b（备用节点）</span>
+        <span class="chip swallowed">结束标记</span>（命中后吞掉、不发给调用方）
+      </p>
+      <p class="legend">
+        结束标记按 <b>空格分隔的完整词元</b> 匹配：不属于标记的词元照常即时发出，
+        只有仍可能拼成标记的尾部会短暂保留；首次完整命中即结束生成，命中的词元
+        计入上限但不进入输出流。上限用尽或故障终止时，末尾的半截标记照常发出。
       </p>
     </section>
   </main>
